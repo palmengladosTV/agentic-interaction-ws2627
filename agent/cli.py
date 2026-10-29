@@ -56,6 +56,6 @@ def run(question: str) -> tuple[int, Path]:
     return exit_code, log.path
 
 
-def main(argv: list[str] | None = None) -> int:
-    exit_code, _ = run(" ".join(sys.argv[1:] if argv is None else argv))
+def main() -> int:
+    exit_code, _ = run(" ".join(sys.argv[1:]))
     return exit_code

@@ -10,8 +10,10 @@ from . import calendar_tool
 from .config import Config
 from .run_log import RunLog
 
+# Upper bound on model calls per question. Without it, a model that keeps calling the tool would
+# loop forever, and every round resends the whole history (tokens, rate limit, time).
 # One tool round is the normal case; a few more allow questions that span several days.
-MAX_TURNS = 5
+MAX_TURNS = 10
 REQUEST_TIMEOUT_SECONDS = 60
 
 SYSTEM_PROMPT = """\
@@ -32,10 +34,11 @@ has no data for that day: say that, and do not call the day free.\
 
 
 class AgentError(RuntimeError):
-    pass
+    """The model gave no usable answer (empty text, or no text within MAX_TURNS)."""
 
 
 def _tool_choice(turn: int) -> str:
+    """How free the model is in this turn: must call the tool, may call it, or must answer."""
     if turn == 1:
         return "required"  # the answer must be grounded in the calendar
     if turn == MAX_TURNS:
@@ -44,6 +47,11 @@ def _tool_choice(turn: int) -> str:
 
 
 def answer(question: str, config: Config, log: RunLog) -> str:
+    """Answer one question about the calendar and return the model's text answer.
+
+    Each turn is one model call. If the model asks for tools, they are run and their results are
+    appended to the history for the next turn; the first turn without tool calls is the answer.
+    """
     client = OpenAI(
         base_url=config.base_url, api_key=config.api_key, timeout=REQUEST_TIMEOUT_SECONDS
     )
@@ -111,6 +119,7 @@ def answer(question: str, config: Config, log: RunLog) -> str:
 
 
 def _complete(client: OpenAI, config: Config, messages: list, tool_choice: str):
+    """One model call with the whole history so far and the calendar tool on offer."""
     return client.chat.completions.create(
         model=config.model,
         messages=messages,
@@ -120,6 +129,10 @@ def _complete(client: OpenAI, config: Config, messages: list, tool_choice: str):
 
 
 def _run_tool(call: dict, turn: int, config: Config, log: RunLog) -> dict:
+    """Execute one tool call of the model, log it, and return the result for the model.
+
+    Failures come back as a result with "error", so the model can react instead of the run crashing.
+    """
     name = call["function"]["name"]
     arguments = call["function"]["arguments"]
     started = time.perf_counter()
@@ -150,4 +163,5 @@ def _parse_args(arguments: str) -> object:
 
 
 def _elapsed_ms(started: float) -> int:
+    """Milliseconds since started, a time.perf_counter() value."""
     return round((time.perf_counter() - started) * 1000)
