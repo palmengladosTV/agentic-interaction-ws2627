@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Exercise: secrets and per-run agent logs must never be committed
+.env
+logs/
+# PyCharm project settings are personal
+.idea/
+stuff/
