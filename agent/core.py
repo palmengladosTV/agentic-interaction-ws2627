@@ -13,8 +13,9 @@ from datetime import date
 import openai
 from openai import OpenAI
 
-from . import calendar_tool
+from . import tools
 from .config import Config
+from .data_service import DataService
 from .run_log import RunLog
 
 REQUEST_TIMEOUT_SECONDS = 60
@@ -23,21 +24,25 @@ REQUEST_TIMEOUT_SECONDS = 60
 STEP_RETRY_DELAY_SECONDS = 5
 
 SYSTEM_PROMPT = """\
-You are a calendar assistant. Today is {today}.
-Look up the appointments with the tool {tool} before you answer; never invent or guess appointments.
-Convert every date in the question to YYYY-MM-DD for the tool, and resolve relative dates such as \
-"tomorrow" against today. For a question about several days, look up every one of them.
+You are an assistant for appointments, weather and train connections. Today is {today}.{home}
+Take every fact from the tools. Never invent or guess appointments, weather, trains or times, and \
+do not fill gaps with general knowledge.
+Convert every date in the question to YYYY-MM-DD for the tools, and resolve relative dates such as \
+"tomorrow" against today. A question can need several different tools and several calls: look up \
+every day, place and route it asks about. For the weather on a trip, look at the destination; add \
+the place of departure when that helps.
 If a tool result contains an error, correct the arguments and try again when that can help; \
-otherwise say which day could not be read.
-You can only read appointments, not create, change or delete them. If someone asks for that, say \
-so briefly instead of calling the tool.
+otherwise say what could not be read.
+A result with data_available false means there is no data for that day, place or route: say so \
+plainly and give no values for it. An empty event list means the day is free.
+You can only read, not create, change, book or delete anything. If someone asks for that, say so \
+briefly instead of calling a tool.
 Answer in the same language as the question: an English question gets an English answer, a German \
 question a German one. Keep it short and use plain text without Markdown, because the answer is \
 printed in a terminal.
-For each appointment give start and end time (or "all day"), title and location; leave out an \
-empty location.
-An empty event list means the day is free. A result with data_available false means the calendar \
-has no data for that day: say that, and do not call the day free.\
+For appointments give start and end time (or "all day"), title and location; leave out an empty \
+location. For trains give the train with departure and arrival time. For weather give condition, \
+temperature and chance of rain, and answer what was asked, e.g. whether an umbrella is needed.\
 """
 
 
@@ -50,7 +55,7 @@ class StepLimitError(AgentError):
 
 
 def answer(question: str, config: Config, log: RunLog) -> str:
-    """Answer one question about the calendar and return the model's text answer.
+    """Answer one question with the tools and return the model's text answer.
 
     Raises StepLimitError if there is no answer after config.max_steps steps, and lets errors
     through that another step cannot fix.
@@ -58,12 +63,16 @@ def answer(question: str, config: Config, log: RunLog) -> str:
     client = OpenAI(
         base_url=config.base_url, api_key=config.api_key, timeout=REQUEST_TIMEOUT_SECONDS
     )
+    # Cities, routes and the user's home come from the data service, not from the code.
+    data = DataService.connect(config.data_base_url)
+    tool_definitions = tools.definitions(data)
     today = date.today()
+    home = data.describe_home()
     messages = [
         {
             "role": "system",
             "content": SYSTEM_PROMPT.format(
-                today=f"{today:%A}, {today.isoformat()}", tool=calendar_tool.NAME
+                today=f"{today:%A}, {today.isoformat()}", home=f" {home}" if home else ""
             ),
         },
         {"role": "user", "content": question},
@@ -71,11 +80,11 @@ def answer(question: str, config: Config, log: RunLog) -> str:
     tool_used = False
 
     for step in range(1, config.max_steps + 1):
-        # Until a tool has run, the model must call one: the answer has to rest on calendar data.
+        # Until a tool has run, the model must call one: the answer has to rest on tool data.
         tool_choice = "auto" if tool_used else "required"
         started = time.perf_counter()
         try:
-            message = _model_step(client, config, messages, tool_choice)
+            message = _model_step(client, config, messages, tool_definitions, tool_choice)
         except openai.APIError as err:
             if not _is_recoverable(err):
                 raise
@@ -119,7 +128,7 @@ def answer(question: str, config: Config, log: RunLog) -> str:
                 {
                     "role": "tool",
                     "tool_call_id": call["id"],
-                    "content": json.dumps(_run_tool(call, step, config, log), ensure_ascii=False),
+                    "content": json.dumps(_run_tool(call, step, data, log), ensure_ascii=False),
                 }
             )
         tool_used = True
@@ -127,25 +136,29 @@ def answer(question: str, config: Config, log: RunLog) -> str:
     raise StepLimitError(f"step limit reached: no answer after {config.max_steps} steps")
 
 
-def _model_step(client: OpenAI, config: Config, messages: list, tool_choice: str):
+def _model_step(
+    client: OpenAI, config: Config, messages: list, tool_definitions: list, tool_choice: str
+):
     """One step: a model call with the whole history so far. Returns the model's message."""
     try:
-        response = _complete(client, config, messages, tool_choice)
+        response = _complete(client, config, messages, tool_definitions, tool_choice)
     except openai.BadRequestError as err:
         # Groq rejects "required" when the model answers in text instead, e.g. for a request
-        # the read-only tool cannot serve. Ask again within the same step without forcing a tool.
+        # the read-only tools cannot serve. Ask again within the same step without forcing a tool.
         if tool_choice != "required" or err.code != "tool_use_failed":
             raise
-        response = _complete(client, config, messages, "auto")
+        response = _complete(client, config, messages, tool_definitions, "auto")
     return response.choices[0].message
 
 
-def _complete(client: OpenAI, config: Config, messages: list, tool_choice: str):
-    """One model call with the whole history so far and the calendar tool on offer."""
+def _complete(
+    client: OpenAI, config: Config, messages: list, tool_definitions: list, tool_choice: str
+):
+    """One model call with the whole history so far and all tools on offer."""
     return client.chat.completions.create(
         model=config.model,
         messages=messages,
-        tools=[calendar_tool.DEFINITION],
+        tools=tool_definitions,
         tool_choice=tool_choice,
     )
 
@@ -175,7 +188,7 @@ def _log_failed_step(log: RunLog, step: int, started: float, error_type: str, er
     )
 
 
-def _run_tool(call: dict, step: int, config: Config, log: RunLog) -> dict:
+def _run_tool(call: dict, step: int, data: DataService, log: RunLog) -> dict:
     """Execute one tool call of the model, log it, and return the result for the model.
 
     Failures come back as a result with "error", so the model can react instead of the run crashing.
@@ -184,16 +197,13 @@ def _run_tool(call: dict, step: int, config: Config, log: RunLog) -> dict:
     arguments = call["function"]["arguments"]
     started = time.perf_counter()
     try:
-        if name == calendar_tool.NAME:
-            result = calendar_tool.run(arguments, config.data_base_url)
-        else:
-            result = {"error": f"unknown tool {name!r}"}
+        result = tools.run(name, arguments, data)
     except Exception as err:
         # Even a bug in a tool must not end the run; the model sees the error and can go on.
         result = {"error": f"tool {name!r} failed: {type(err).__name__}: {err}"}
     log.write(
         "tool_result",
-        # A day without data (HTTP 404) is a valid result; only an "error" result failed.
+        # A day, place or route without data is a valid result; only an "error" result failed.
         ok="error" not in result,
         duration_ms=_elapsed_ms(started),
         tool=name,

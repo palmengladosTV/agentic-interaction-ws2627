@@ -50,12 +50,13 @@ python chat.py
 
 ### How it works
 
-- `agent/calendar_tool.py`: the tool `get_calendar_day(date)`. Its name, purpose and parameter
-  are passed to the model as a description. It fetches `{DATA_BASE_URL}/calendar/{YYYY-MM-DD}.json`.
-  A 404 from the data service ("no data") and other failures are returned to the model as a
-  result instead of crashing the agent.
+- `agent/tools/`: the tools the model can call (see exercise 4 below), one module per tool, and
+  a registry in `__init__.py` that hands their descriptions to the model and runs a call. Name,
+  purpose and parameters of each tool are passed to the model as a description.
+- `agent/data_service.py`: HTTP access to `DATA_BASE_URL` for all tools. A 404 ("no data") and
+  other failures are returned to the model as a result instead of crashing the agent.
 - `agent/core.py`: the agent loop (see exercise 3 below). Until a tool has run, the model must
-  call one, so every answer is grounded in the calendar. The tool results go back to the model,
+  call one, so every answer is grounded in the data. The tool results go back to the model,
   which then answers or takes further steps.
 - `agent/config.py`: loads `.env` and the environment.
 - `agent/run_log.py`: the per-run JSONL log.
@@ -85,7 +86,7 @@ What the events mean and which extra fields they carry:
 |---|---|---|---|
 | `user_task` | the question from the command line | `0` | `task`, `base_url`, `data_base_url`, `max_steps` |
 | `tool_call` | the model asks for a tool | the model call | `step`, `tool_call_id` |
-| `tool_result` | the tool ran; `ok` is `false` if it returned an error (a day without data, HTTP 404, is a valid result) | the tool execution | `step`, `tool_call_id`, `result` |
+| `tool_result` | the tool ran; `ok` is `false` if it returned an error (a day, place or route without data is a valid result) | the tool execution | `step`, `tool_call_id`, `result` |
 | `final` | the model answers; the run ends with exit code 0 | the model call | `step`, `answer` |
 | `error` with `fatal: false` | one step failed, the next step tries again | the failed model call | `step`, `error_type`, `error` |
 | `error` with `fatal: true` | the run ends without an answer (exit code ≠ 0) | the run up to the error | `error_type`, `error`, `exit_code` |
@@ -146,8 +147,8 @@ Offline tests replace the model and the data service with scripted fakes and run
 python -m unittest -v
 ```
 
-They cover single- and multi-day questions, the step limit, unrecoverable errors, and every kind of
-error along the way listed above.
+They cover single- and multi-day questions, the step limit, unrecoverable errors, every kind of
+error along the way listed above, and the tools and gaps of exercise 4.
 
 ### Own multi-step tests
 
@@ -164,3 +165,73 @@ of events, numbers are steps:
 | "Was steht am 29.10.2026 im Kalender?" | `DATA_BASE_URL=http://127.0.0.1:9/v1` | 0 | `tool_result` with `ok: false` (connection refused), the run went on and the answer says the calendar could not be reached |
 | "What is on 29 Oct 2026 and on 30 Oct 2026?" | `MAX_STEPS=1` | 1 | 1: tool 29 Oct, then `error` with `fatal: true`, `StepLimitError`; nothing on stdout |
 | "Was steht am 29.10.2026 im Kalender?" | `OPENAI_BASE_URL=http://127.0.0.1:9/v1`, `MAX_STEPS=2` | 1 | 1 and 2: `error` with `fatal: false`, `APIConnectionError`; then `error` with `fatal: true`, `StepLimitError` |
+
+## Exercise 4: Two more tools
+
+The agent has three tools now. Each reads one kind of mock data via `DATA_BASE_URL`, with the
+paths and conventions of the data repository (dates as `YYYY-MM-DD`, cities as codes):
+
+| Tool | Parameters | Endpoint under `DATA_BASE_URL` | Returns |
+|---|---|---|---|
+| `get_calendar_day` | `date` | `calendar/{date}.json` | the appointments of the day |
+| `get_weather` | `city`, `date` | `weather/{city}/{date}.json` | condition, temperature, rain probability (0 to 1), wind |
+| `get_connections` | `from`, `to`, `date` | `transit/{from}/{to}/{date}.json` | trains with departure, arrival, changes and price |
+
+A task can need several of them; the loop from exercise 3 runs them in as many steps as needed:
+
+```bash
+python -m agent "How do I get to Munich on 29 Oct 2026, and do I need an umbrella?"
+```
+
+### What the model is told
+
+- **Cities and routes come from the data service, not from the code.** At start-up the agent reads
+  `index.json` (cities and routes) and `context.json` (the user's home) once. The tool
+  descriptions then list the city codes (`ulm (Ulm), muenchen (München)`) and the routes
+  (`ulm -> muenchen, muenchen -> ulm`), and the system prompt says that trips start at home (Ulm)
+  unless the question says otherwise. With another `DATA_BASE_URL` the descriptions follow its
+  data. If the two files cannot be read, the tools still work with general descriptions.
+- **City names are mapped to codes.** "München", "Muenchen" and "muenchen" all become `muenchen`.
+
+### Gaps: no data, no invented values
+
+- **Day or route without data** (HTTP 404, e.g. weather in Munich on 30 Oct): the tool returns
+  `data_available: false` with a message, the request it belongs to, and no values.
+- **Place without data** (e.g. Berlin): the tool does not even ask the data service. It returns
+  `data_available: false` and names the cities that do have data.
+- **The system prompt** says to take every fact from the tools, to say plainly when there is no
+  data, and never to fill a gap with guesses or general knowledge.
+
+A gap is a valid result (`tool_result` with `ok: true`), not an error; `ok: false` stays reserved
+for failures such as an invalid date or an unreachable data service.
+
+### Code
+
+- `agent/data_service.py`: `DataService.connect()` reads `index.json` and `context.json`; `get()`
+  does the HTTP GET for every tool and turns 404 and failures into results; `city_code()` maps
+  names to codes.
+- `agent/tools/calendar_day.py`, `weather.py`, `connections.py`: one module per tool with
+  `NAME`, `definition(data)` (the description for the model) and `run(arguments, data)`.
+- `agent/tools/args.py`: checks the arguments; invalid ones go back to the model as an error.
+- `agent/tools/__init__.py`: the registry. `definitions()` collects all descriptions for the
+  model, `run()` executes one tool call by name.
+
+### Own tests with two tools
+
+Real runs against Groq (`openai/gpt-oss-20b`) on 22 Nov 2026, checked in each run's log. All ended
+with exit code 0:
+
+| Task | What the log shows | Answer |
+|---|---|---|
+| "How do I get to Munich on 29 Oct 2026, and do I need an umbrella?" | 1: `get_connections(ulm, muenchen, 2026-10-29)`, 2: `get_weather(muenchen, 2026-10-29)`, 3: `final` | four trains (e.g. ICE 596, 08:12 → 09:33); showers, 8 °C, 60 %: take an umbrella |
+| "Wie komme ich am 2.11.2026 nach München, und wie wird dort das Wetter?" | connections Ulm → München, weather München, `final` | ICE 594, 07:12 → 08:31; overcast, 6 °C, 20 % |
+| "Was steht am 29.10.2026 im Kalender, und welcher Zug bringt mich rechtzeitig zum Werkstattbesuch?" | calendar 29 Oct, then connections Ulm → München, `final` | the three appointments and trains that arrive before 11:00 |
+| "Do I need an umbrella in Munich on 30 Oct 2026?" | weather München 30 Oct: `data_available: false` | no weather data for Munich on that day, no values |
+| "Gibt es am 2.11.2026 einen Zug von München zurück nach Ulm?" | connections München → Ulm 2 Nov: `data_available: false` | no connections known for that day |
+| "Wie wird das Wetter am 29.10.2026 in Berlin?" | no tool call: the model saw in the tool description that there is data only for Ulm and München; Groq rejected the forced tool call, and the agent asked again without forcing one | no weather data for Berlin, no values |
+| "Was steht am 29.10.2026 im Kalender?" (exercise 1) | calendar 29 Oct, `final` | the three appointments |
+| "What is on 29 Oct 2026 and on 30 Oct 2026?" (exercise 3) | calendar 29 Oct, calendar 30 Oct, `final` | both days, 30 Oct free |
+
+In the first round, the model looked up the weather in Ulm (home) instead of Munich for the first
+task. The system prompt now says that the weather on a trip means the destination; two further
+runs of the task, in English and in German, both asked for Munich.
